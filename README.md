@@ -131,6 +131,10 @@ print(f"Near misses:   {len(stats.near_misses)}")
 print(f"Top queries:   {[(q.query, q.count) for q in stats.top_queries[:3]]}")
 ```
 
+### Full examples
+
+The snippets above cover the basics. For a complete walkthrough of every feature — backends, embedding providers, similarity metrics, confidence classification, retrieval, async, analytics, logging, error handling, and custom backend patterns — see [examples/quickstart_redis.py](examples/quickstart_redis.py).
+
 ## Architecture
 
 The library is organised into three layers:
