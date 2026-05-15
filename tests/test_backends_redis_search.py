@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, PropertyMock
 import numpy as np
 import pytest
 
+from redis.exceptions import ResponseError
+
 from llmgatekeeper.backends.redis_search import RediSearchBackend
+from llmgatekeeper.exceptions import BackendError, ConfigurationError
 
 
 class MockFTInfo:
@@ -113,6 +116,76 @@ class TestRediSearchBackendInit:
         )
         assert backend._namespace == "custom_ns"
         assert backend._index_name == "custom_ns_idx"
+
+
+class TestRediSearchBackendDistanceMetric:
+    """Tests for distance metric validation."""
+
+    def test_non_cosine_metric_raises(self, mock_redis_with_redisearch):
+        """L2 / IP would produce wrong similarity scores under current conversion."""
+        with pytest.raises(ConfigurationError, match="distance_metric"):
+            RediSearchBackend(mock_redis_with_redisearch, distance_metric="L2")
+
+    def test_cosine_metric_accepted(self, mock_redis_with_redisearch):
+        """COSINE remains the only supported metric."""
+        backend = RediSearchBackend(
+            mock_redis_with_redisearch, distance_metric="COSINE"
+        )
+        assert backend._distance_metric == "COSINE"
+
+
+class TestRediSearchBackendDimensionValidation:
+    """Tests that pre-existing index dimension is validated against constructor arg."""
+
+    def test_mismatched_dimension_raises(self, mock_redis_with_redisearch):
+        """Existing index with dim=384 + constructor dim=768 must raise."""
+        mock_ft = mock_redis_with_redisearch.ft.return_value
+        mock_ft.info.return_value = {
+            "attributes": [
+                [
+                    "identifier",
+                    "$.vector",
+                    "attribute",
+                    "vector",
+                    "type",
+                    "VECTOR",
+                    "algorithm",
+                    "HNSW",
+                    "data_type",
+                    "FLOAT32",
+                    "dim",
+                    "384",
+                ],
+            ]
+        }
+
+        with pytest.raises(ConfigurationError, match="dimension"):
+            RediSearchBackend(mock_redis_with_redisearch, vector_dimension=768)
+
+    def test_matching_dimension_ok(self, mock_redis_with_redisearch):
+        """Existing index with same dim does not raise."""
+        mock_ft = mock_redis_with_redisearch.ft.return_value
+        mock_ft.info.return_value = {
+            "attributes": [
+                [
+                    "identifier",
+                    "$.vector",
+                    "attribute",
+                    "vector",
+                    "type",
+                    "VECTOR",
+                    "algorithm",
+                    "HNSW",
+                    "data_type",
+                    "FLOAT32",
+                    "dim",
+                    "384",
+                ],
+            ]
+        }
+
+        backend = RediSearchBackend(mock_redis_with_redisearch, vector_dimension=384)
+        assert backend._vector_dimension == 384
 
 
 class TestRediSearchBackendStoreAndGet:
@@ -264,16 +337,60 @@ class TestRediSearchBackendSearch:
         assert len(results) == 3
 
     def test_knn_search_empty_results(self, mock_redis_with_redisearch):
-        """Returns empty list when no matches."""
+        """Returns empty list when the index reports 'no such index'."""
         backend = RediSearchBackend(mock_redis_with_redisearch)
 
         mock_ft = mock_redis_with_redisearch.ft.return_value
-        mock_ft.search.side_effect = Exception("No results")
+        mock_ft.search.side_effect = ResponseError("no such index")
 
         query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         results = backend.search_similar(query_vec, threshold=0.9, top_k=5)
 
         assert len(results) == 0
+
+    def test_knn_search_propagates_other_errors(self, mock_redis_with_redisearch):
+        """Unrelated errors must surface as BackendError, not silent empties."""
+        backend = RediSearchBackend(mock_redis_with_redisearch)
+
+        mock_ft = mock_redis_with_redisearch.ft.return_value
+        mock_ft.search.side_effect = ResponseError("connection lost")
+
+        query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        with pytest.raises(BackendError):
+            backend.search_similar(query_vec, threshold=0.9, top_k=5)
+
+
+class TestRediSearchBackendQueryShape:
+    """Threshold-filtered searches must use VECTOR_RANGE, not oversampled KNN."""
+
+    def test_search_with_threshold_uses_range_query(
+        self, mock_redis_with_redisearch
+    ):
+        backend = RediSearchBackend(mock_redis_with_redisearch, vector_dimension=3)
+        mock_ft = mock_redis_with_redisearch.ft.return_value
+        mock_ft.search.return_value = MockFTSearch([])
+
+        query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        backend.search_similar(query_vec, threshold=0.85, top_k=5)
+
+        query_arg = mock_ft.search.call_args.args[0]
+        query_str = getattr(query_arg, "_query_string", str(query_arg))
+        assert "VECTOR_RANGE" in query_str
+
+    def test_search_without_threshold_uses_knn(
+        self, mock_redis_with_redisearch
+    ):
+        backend = RediSearchBackend(mock_redis_with_redisearch, vector_dimension=3)
+        mock_ft = mock_redis_with_redisearch.ft.return_value
+        mock_ft.search.return_value = MockFTSearch([])
+
+        query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        backend.search_similar(query_vec, threshold=0.0, top_k=5)
+
+        query_arg = mock_ft.search.call_args.args[0]
+        query_str = getattr(query_arg, "_query_string", str(query_arg))
+        assert "KNN" in query_str
+        assert "VECTOR_RANGE" not in query_str
 
 
 class TestRediSearchBackendDelete:

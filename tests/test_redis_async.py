@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from llmgatekeeper.backends.redis_async import AsyncRedisBackend
+from llmgatekeeper.exceptions import BackendError
 
 
 @pytest.fixture
@@ -20,6 +21,7 @@ def mock_async_redis():
     redis.scard = AsyncMock(return_value=0)
     redis.delete = AsyncMock(return_value=1)
     redis.expire = AsyncMock()
+    redis.hget = AsyncMock(return_value=None)
     return redis
 
 
@@ -54,7 +56,7 @@ class TestAsyncRedisBackendStoreVector:
 
         await async_backend.store_vector("key1", vector, metadata)
 
-        mock_async_redis.hset.assert_called_once()
+        mock_async_redis.hset.assert_called()
         mock_async_redis.sadd.assert_called_once()
 
     @pytest.mark.asyncio
@@ -194,6 +196,26 @@ class TestAsyncRedisBackendClear:
         result = await async_backend.clear()
 
         assert result == 2
+
+
+class TestAsyncRedisBackendDimensionValidation:
+    """Async backend rejects vectors whose dimension contradicts a prior write."""
+
+    @pytest.mark.asyncio
+    async def test_store_mismatched_dim_raises(self, async_backend, mock_async_redis):
+        mock_async_redis.hget = AsyncMock(return_value=b"3")
+        with pytest.raises(BackendError, match="dimension"):
+            await async_backend.store_vector(
+                "k1", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), {}
+            )
+
+    @pytest.mark.asyncio
+    async def test_search_mismatched_dim_raises(self, async_backend, mock_async_redis):
+        mock_async_redis.hget = AsyncMock(return_value=b"3")
+        with pytest.raises(BackendError, match="dimension"):
+            await async_backend.search_similar(
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            )
 
 
 class TestAsyncRedisBackendCount:

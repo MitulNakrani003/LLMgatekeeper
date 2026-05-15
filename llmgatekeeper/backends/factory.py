@@ -1,11 +1,13 @@
 """Factory for creating Redis backends with auto-detection."""
 
-from typing import Optional
+from typing import Any, Optional
 
 from redis import Redis
 
-from llmgatekeeper.backends.base import CacheBackend
+from llmgatekeeper.backends.base import AsyncCacheBackend, CacheBackend
+from llmgatekeeper.backends.redis_async import AsyncRedisBackend
 from llmgatekeeper.backends.redis_search import RediSearchBackend
+from llmgatekeeper.backends.redis_search_async import AsyncRediSearchBackend
 from llmgatekeeper.backends.redis_simple import RedisSimpleBackend
 
 
@@ -75,4 +77,61 @@ def create_redis_backend(
     return RedisSimpleBackend(
         redis_client=redis_client,
         namespace=namespace,
+    )
+
+
+async def create_async_redis_backend(
+    redis_client: Any,
+    namespace: str = "llmgk",
+    vector_dimension: int = 384,
+    force_simple: bool = False,
+) -> AsyncCacheBackend:
+    """Async counterpart to ``create_redis_backend``.
+
+    Auto-detects RediSearch on the provided ``redis.asyncio.Redis`` client.
+    The detection itself requires a round trip, so this factory is async.
+
+    Args:
+        redis_client: ``redis.asyncio.Redis`` instance.
+        namespace: Key prefix for all cache entries (default: "llmgk").
+        vector_dimension: Embedding dimension (default: 384).
+        force_simple: If True, always return ``AsyncRedisBackend``.
+
+    Returns:
+        An ``AsyncCacheBackend`` ready for use. RediSearch backend will have
+        been connected and the index ensured to exist.
+    """
+    if force_simple:
+        return AsyncRedisBackend(
+            redis_client=redis_client, namespace=namespace
+        )
+
+    try:
+        modules = await redis_client.module_list()
+        has_search = any(
+            (
+                (
+                    m.get("name", m.get(b"name", b"")).decode()
+                    if isinstance(m.get("name", m.get(b"name", b"")), bytes)
+                    else m.get("name", m.get(b"name", b""))
+                )
+                or ""
+            ).lower()
+            in ("search", "ft")
+            for m in modules
+        )
+    except Exception:
+        has_search = False
+
+    if has_search:
+        backend = AsyncRediSearchBackend(
+            redis_client=redis_client,
+            namespace=namespace,
+            vector_dimension=vector_dimension,
+        )
+        await backend.connect()
+        return backend
+
+    return AsyncRedisBackend(
+        redis_client=redis_client, namespace=namespace
     )

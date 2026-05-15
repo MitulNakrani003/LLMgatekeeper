@@ -40,14 +40,16 @@ The package is designed for maximum simplicity and compatibility—requiring jus
 
 **Architecture points:**
 
-- Abstract `CacheBackend` interface with methods: `store_vector()`, `search_similar()`, `delete()`, `get_by_key()`
+- Abstract `CacheBackend` and `AsyncCacheBackend` interfaces with methods: `store_vector()`, `search_similar()`, `delete()`, `get_by_key()`, `clear()`, `count()` (all `@abstractmethod`)
 - Redis adapter operates in two modes:
-    - **Simple mode**: Uses Redis hashes + brute-force similarity (good for <10k entries)
-    - **RediSearch mode**: Uses Redis vector similarity search (scales to millions)
-- Adapter auto-detects if RediSearch module is available and upgrades automatically
+    - **Simple mode** (`RedisSimpleBackend`/`AsyncRedisBackend`): Redis hashes + brute-force similarity, fetched in a single pipelined round trip (good for <10k entries)
+    - **RediSearch mode** (`RediSearchBackend`/`AsyncRediSearchBackend`): RediSearch vector index using `VECTOR_RANGE` for threshold-filtered queries and KNN for unfiltered ones (scales to millions)
+- `create_redis_backend` / `create_async_redis_backend` factories auto-detect the RediSearch module on the supplied client and pick the right backend
 - Connection pooling handled by user's existing Redis instance (you just wrap it)
+- Backends record the embedding dimension on first write under `{namespace}:meta`; mismatched stores or queries raise `BackendError` before any numpy operation can produce garbage
+- RediSearch backends additionally validate an existing index's `DIM` on attach and reject non-COSINE distance metrics
 
-**Key insight:** The user passes their `redis.Redis` instance, you don't create connections. This respects their existing connection pooling, auth, SSL config, etc.
+**Key insight:** The user passes their `redis.Redis` (or `redis.asyncio.Redis`) instance, you don't create connections. This respects their existing connection pooling, auth, SSL config, etc.
 
 ### 2. Embedding Engine Layer
 
@@ -55,45 +57,55 @@ The package is designed for maximum simplicity and compatibility—requiring jus
 
 **Architecture points:**
 
-- Pluggable embedding providers via strategy pattern
-- Default to a small, fast local model (e.g., `all-MiniLM-L6-v2`) for zero-config start
+- Pluggable embedding providers via strategy pattern (`EmbeddingProvider` ABC)
+- Default to a small, fast local model (`all-MiniLM-L6-v2`) for zero-config start
 - Batch embedding support for bulk operations
-- Embedding caching (yes, cache the cache operation) - store query→embedding mappings to avoid re-embedding identical strings
-- Async support for non-blocking embedding calls
-- Dimension normalization across providers (some return 384-dim, others 1536-dim)
+- Embedding caching via `CachedEmbeddingProvider` — LRU in memory plus optional Redis persistence. Cache keys are fingerprinted with the wrapped provider's class + dimension + model name, so two providers can safely share the same Redis embedding cache without colliding on identical text. The in-memory LRU is guarded by a `threading.Lock`.
+- Async support for non-blocking embedding calls. `SentenceTransformerProvider.aembed/aembed_batch` use `asyncio.to_thread` so the heavy local model encode never blocks the event loop. `OpenAIEmbeddingProvider` uses the native async OpenAI client.
+- Dimension is reported via the provider's `dimension` property; backends use this to validate that stored and queried vectors share a shape.
 
-**Key insight:** The embedding model choice affects your similarity threshold. A 0.96 threshold on OpenAI embeddings means something different than 0.96 on MiniLM. Consider providing calibration utilities or documenting recommended thresholds per model.
+**Key insight:** The embedding model choice affects your similarity threshold. A 0.96 threshold on OpenAI embeddings means something different than 0.96 on MiniLM. The library ships per-model defaults (`MODEL_THRESHOLDS` in `similarity/confidence.py`) and auto-applies them when the model name is recognised.
 
 ### 3. Similarity Engine Layer
 
-**Why it matters:** Cosine similarity isn't always the right choice. Some embedding models are trained with dot product, euclidean distance captures different semantics.
+**Why it matters:** Threshold tuning is the difference between useful and dangerous caching.
 
 **Architecture points:**
 
-- Configurable similarity metric
-- Threshold is the critical parameter - too high misses valid cache hits, too low returns wrong answers
-- Support for "confidence bands": return `high_confidence`, `medium_confidence`, `low_confidence` hits
-- Multi-result retrieval: sometimes you want top-3 similar cached responses for ensemble/voting
+- Cosine similarity is the canonical metric — `RediSearchBackend` only accepts `DISTANCE_METRIC=COSINE` and the simple backends use cosine in `_cosine_similarity`. Dot-product and Euclidean helpers exist in `similarity/metrics.py` as standalone functions but are not wired through `SemanticCache`.
+- Threshold is the critical parameter — too high misses valid cache hits, too low returns wrong answers.
+- `ConfidenceClassifier` exposes confidence bands (`HIGH` / `MEDIUM` / `LOW` / `NONE`) with model-specific defaults.
+- `SimilarityRetriever` supports multi-result retrieval (top-K) for ensemble/voting scenarios.
+- Hit/miss decision happens in `SemanticCache.get`, not in the backend: the backend is queried with `threshold=0` and the cache filters in Python. This guarantees one backend round trip per `get`, even when analytics is tracking near-misses.
 
-### 4. Advanced Features To Include
+### 4. Advanced Features
 
 **a) Namespace/Tenant Isolation**
 
 - Multi-tenant SaaS apps need cache isolation per customer
 - `SemanticCache(namespace="tenant_123")` prefixes all keys
+- Each namespace owns an independent `{namespace}:meta` (recorded dimension), `{namespace}:keys` (tracked keys), and — for the RediSearch backend — `{namespace}_idx` index
 - Prevents data leakage between tenants
 
 **b) Cache Warming**
 
 - Bulk-load common queries during deployment
-- `cache.warm([(query1, response1), (query2, response2), ...])`
+- `cache.warm([(query1, response1), ...], batch_size=100, on_progress=callback)`
+- Uses `embed_batch` under the hood for throughput, with progress callbacks per batch
 
 **c) Analytics/Observability**
 
-- Hit rate tracking
-- Latency percentiles
-- Most frequently hit queries
+- Hit rate tracking, latency percentiles (p50/p95/p99/avg)
+- Most frequently hit queries (top-K by access count)
 - Near-miss tracking (queries that almost matched but fell below threshold)
+- Opt-in via `enable_analytics=True`; disabled by default with zero overhead
+- One backend round trip per `get()` whether it hits or misses — analytics never doubles request volume
+
+**d) Internal-vs-user metadata isolation**
+
+- The cache reserves a single key (`_llmgk`) in stored metadata for its own bookkeeping (query and response text)
+- User-supplied metadata, including keys named `query` or `response`, is stored verbatim alongside and round-trips unchanged
+- Legacy entries (pre-rename) without `_llmgk` are still readable: `query`/`response` are looked up at the top level for backward compatibility
 
 # Tech Stack: LLMGatekeeper Cache Module
 
@@ -101,4 +113,4 @@ The **LLMGatekeeper Cache Module** is built on a high-performance Python-based s
 
 
 
-Semantic processing is handled by the **Sentence-Transformers** library, which runs the `all-MiniLM-L6-v2` model locally to provide zero-config, low-latency embeddings. This is paired with **NumPy** or **scikit-learn** to drive the similarity engine, allowing for configurable distance metrics—such as Cosine Similarity or Euclidean Distance—to define precision thresholds. Finally, the architecture is designed to be provider-agnostic, supporting optional integration with **OpenAI** for high-dimension embeddings and various vector databases like **Pinecone** or **Qdrant** through a pluggable adapter layer.
+Semantic processing is handled by the **Sentence-Transformers** library, which runs the `all-MiniLM-L6-v2` model locally to provide zero-config, low-latency embeddings. This is paired with **NumPy** to drive the similarity engine. Cosine similarity is the canonical metric — RediSearch indexes are created with `DISTANCE_METRIC=COSINE`, and the simple backends use cosine in their brute-force search; standalone dot-product and Euclidean helpers live in `similarity/metrics.py` for ad-hoc use. The architecture is provider-agnostic, supporting optional integration with **OpenAI** for high-dimension embeddings through a pluggable adapter layer; alternative vector stores can be added by implementing the `CacheBackend` / `AsyncCacheBackend` interfaces.

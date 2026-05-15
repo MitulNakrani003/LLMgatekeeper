@@ -5,35 +5,59 @@ for storing and retrieving cached responses based on semantic similarity.
 It also provides AsyncSemanticCache for async/await usage.
 """
 
-import asyncio
 import hashlib
 import time
-import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
 
 from llmgatekeeper.analytics import CacheAnalytics, CacheStats
-from llmgatekeeper.backends.base import AsyncCacheBackend, CacheBackend, SearchResult
+from llmgatekeeper.backends.base import AsyncCacheBackend, CacheBackend
 from llmgatekeeper.backends.factory import create_redis_backend
 from llmgatekeeper.embeddings.base import EmbeddingProvider
 from llmgatekeeper.embeddings.sentence_transformer import SentenceTransformerProvider
 from llmgatekeeper.exceptions import BackendError, EmbeddingError
 from llmgatekeeper.logging import get_logger
 from llmgatekeeper.similarity.confidence import (
-    ConfidenceClassifier,
     ConfidenceLevel,
     get_model_classifier,
 )
-from llmgatekeeper.similarity.retriever import (
-    RetrievalResult,
-    SimilarityRetriever,
-)
+from llmgatekeeper.similarity.retriever import SimilarityRetriever
 
 # Module logger
 _logger = get_logger(__name__)
+
+# Reserved key in stored metadata for the cache's internal fields (query/response).
+# Keeping these under a single key avoids colliding with user-provided metadata.
+_RESERVED_KEY = "_llmgk"
+
+
+def _pack_metadata(
+    user_metadata: Optional[Dict[str, Any]], query: str, response: str
+) -> Dict[str, Any]:
+    """Build the metadata dict to write, isolating internal fields under _RESERVED_KEY."""
+    packed: Dict[str, Any] = dict(user_metadata) if user_metadata else {}
+    packed[_RESERVED_KEY] = {"query": query, "response": response}
+    return packed
+
+
+def _unpack_response(stored: Dict[str, Any]) -> Optional[str]:
+    """Read the cached response from stored metadata, with legacy fallback."""
+    internal = stored.get(_RESERVED_KEY)
+    if isinstance(internal, dict) and "response" in internal:
+        return internal["response"]
+    # Backward compatibility with entries written before the reserved-key split.
+    return stored.get("response")
+
+
+def _user_metadata(stored: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal fields, returning only user-supplied metadata."""
+    if _RESERVED_KEY in stored:
+        return {k: v for k, v in stored.items() if k != _RESERVED_KEY}
+    # Legacy entries: query/response lived at top level.
+    return {k: v for k, v in stored.items() if k not in ("query", "response")}
 
 
 @dataclass
@@ -273,10 +297,8 @@ class SemanticCache:
         # Generate cache key
         key = self._generate_key(query)
 
-        # Prepare metadata
-        entry_metadata = metadata.copy() if metadata else {}
-        entry_metadata["query"] = query
-        entry_metadata["response"] = response
+        # Prepare metadata with internal fields isolated under a reserved key
+        entry_metadata = _pack_metadata(metadata, query, response)
 
         # Determine effective TTL:
         # - If ttl is explicitly provided (including 0), use it
@@ -348,37 +370,28 @@ class SemanticCache:
         # Generate embedding for the query
         embedding = self._embed(query)
 
-        # Search for similar entries
+        # Search the unfiltered top match, then decide hit/miss here so analytics
+        # can reuse the closest similarity without issuing a second query.
         effective_threshold = threshold if threshold is not None else self._threshold
         try:
             response = self._retriever.find_similar(
                 query_vector=embedding,
                 top_k=1,
-                threshold=effective_threshold,
+                threshold=0.0,
             )
         except Exception as e:
             _logger.error(f"Backend search failed", query=query[:50], error=str(e))
             raise BackendError(f"Failed to search cache: {e}", original_error=e)
 
-        # Calculate latency
         latency_ms = (time.perf_counter() - start_time) * 1000
 
-        # Check if we have a match
-        if not response.results:
+        top = response.results[0] if response.results else None
+        is_hit = top is not None and top.similarity >= effective_threshold
+
+        if not is_hit:
             _logger.debug(f"Cache miss", query=query[:50], latency_ms=f"{latency_ms:.2f}")
-            # Record miss with analytics
             if self._analytics is not None:
-                # Check for near-miss by searching without threshold
-                near_miss_response = self._retriever.find_similar(
-                    query_vector=embedding,
-                    top_k=1,
-                    threshold=0.0,
-                )
-                closest_similarity = (
-                    near_miss_response.results[0].similarity
-                    if near_miss_response.results
-                    else None
-                )
+                closest_similarity = top.similarity if top is not None else None
                 self._analytics.record_miss(
                     latency_ms=latency_ms,
                     query=query,
@@ -387,8 +400,8 @@ class SemanticCache:
                 )
             return None
 
-        result = response.results[0]
-        cached_response = result.metadata.get("response")
+        result = top
+        cached_response = _unpack_response(result.metadata)
 
         if cached_response is None:
             _logger.debug(f"Cache miss (no response in metadata)", query=query[:50])
@@ -418,11 +431,7 @@ class SemanticCache:
                 similarity=result.similarity,
                 confidence=result.confidence,
                 key=result.key,
-                metadata={
-                    k: v
-                    for k, v in result.metadata.items()
-                    if k not in ("query", "response")
-                },
+                metadata=_user_metadata(result.metadata),
             )
 
         return cached_response
@@ -462,7 +471,7 @@ class SemanticCache:
 
         results = []
         for r in response.results:
-            cached_response = r.metadata.get("response")
+            cached_response = _unpack_response(r.metadata)
             if cached_response is not None:
                 results.append(
                     CacheResult(
@@ -470,11 +479,7 @@ class SemanticCache:
                         similarity=r.similarity,
                         confidence=r.confidence,
                         key=r.key,
-                        metadata={
-                            k: v
-                            for k, v in r.metadata.items()
-                            if k not in ("query", "response")
-                        },
+                        metadata=_user_metadata(r.metadata),
                     )
                 )
 
@@ -635,10 +640,7 @@ class SemanticCache:
                 embedding = embeddings[i]
                 key = self._generate_key(query)
 
-                # Prepare metadata
-                entry_metadata = metadata.copy() if metadata else {}
-                entry_metadata["query"] = query
-                entry_metadata["response"] = response
+                entry_metadata = _pack_metadata(metadata, query, response)
 
                 # Store in backend
                 self._backend.store_vector(
@@ -829,10 +831,8 @@ class AsyncSemanticCache:
         # Generate cache key
         key = self._generate_key(query)
 
-        # Prepare metadata
-        entry_metadata = metadata.copy() if metadata else {}
-        entry_metadata["query"] = query
-        entry_metadata["response"] = response
+        # Prepare metadata with internal fields isolated under a reserved key
+        entry_metadata = _pack_metadata(metadata, query, response)
 
         # Determine effective TTL
         if ttl is not None:
@@ -841,12 +841,19 @@ class AsyncSemanticCache:
             effective_ttl = self._default_ttl
 
         # Store in backend
-        await self._backend.store_vector(
-            key=key,
-            vector=embedding,
-            metadata=entry_metadata,
-            ttl=effective_ttl,
-        )
+        try:
+            await self._backend.store_vector(
+                key=key,
+                vector=embedding,
+                metadata=entry_metadata,
+                ttl=effective_ttl,
+            )
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(
+                f"Failed to store cache entry: {e}", original_error=e
+            )
 
         return key
 
@@ -878,32 +885,28 @@ class AsyncSemanticCache:
         # Generate embedding for the query
         embedding = await self._embed(query)
 
-        # Search for similar entries
+        # Single unfiltered query; hit/miss is decided here so analytics can
+        # reuse the closest similarity without a second backend round trip.
         effective_threshold = threshold if threshold is not None else self._threshold
-        results = await self._backend.search_similar(
-            vector=embedding,
-            threshold=effective_threshold,
-            top_k=1,
-        )
+        try:
+            results = await self._backend.search_similar(
+                vector=embedding,
+                threshold=0.0,
+                top_k=1,
+            )
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"Failed to search cache: {e}", original_error=e)
 
-        # Calculate latency
         latency_ms = (time.perf_counter() - start_time) * 1000
 
-        # Check if we have a match
-        if not results:
-            # Record miss with analytics
+        top = results[0] if results else None
+        is_hit = top is not None and top.similarity >= effective_threshold
+
+        if not is_hit:
             if self._analytics is not None:
-                # Check for near-miss by searching without threshold
-                near_miss_results = await self._backend.search_similar(
-                    vector=embedding,
-                    threshold=0.0,
-                    top_k=1,
-                )
-                closest_similarity = (
-                    near_miss_results[0].similarity
-                    if near_miss_results
-                    else None
-                )
+                closest_similarity = top.similarity if top is not None else None
                 self._analytics.record_miss(
                     latency_ms=latency_ms,
                     query=query,
@@ -912,8 +915,8 @@ class AsyncSemanticCache:
                 )
             return None
 
-        result = results[0]
-        cached_response = result.metadata.get("response")
+        result = top
+        cached_response = _unpack_response(result.metadata)
 
         if cached_response is None:
             if self._analytics is not None:
@@ -936,11 +939,7 @@ class AsyncSemanticCache:
                 similarity=result.similarity,
                 confidence=confidence,
                 key=result.key,
-                metadata={
-                    k: v
-                    for k, v in result.metadata.items()
-                    if k not in ("query", "response")
-                },
+                metadata=_user_metadata(result.metadata),
             )
 
         return cached_response
@@ -965,15 +964,20 @@ class AsyncSemanticCache:
         embedding = await self._embed(query)
         effective_threshold = threshold if threshold is not None else self._threshold
 
-        results = await self._backend.search_similar(
-            vector=embedding,
-            threshold=effective_threshold,
-            top_k=top_k,
-        )
+        try:
+            results = await self._backend.search_similar(
+                vector=embedding,
+                threshold=effective_threshold,
+                top_k=top_k,
+            )
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"Failed to search cache: {e}", original_error=e)
 
         cache_results = []
         for r in results:
-            cached_response = r.metadata.get("response")
+            cached_response = _unpack_response(r.metadata)
             if cached_response is not None:
                 confidence = self._classifier.classify(r.similarity)
                 cache_results.append(
@@ -982,11 +986,7 @@ class AsyncSemanticCache:
                         similarity=r.similarity,
                         confidence=confidence,
                         key=r.key,
-                        metadata={
-                            k: v
-                            for k, v in r.metadata.items()
-                            if k not in ("query", "response")
-                        },
+                        metadata=_user_metadata(r.metadata),
                     )
                 )
 
@@ -1119,10 +1119,7 @@ class AsyncSemanticCache:
                 embedding = embeddings[i]
                 key = self._generate_key(query)
 
-                # Prepare metadata
-                entry_metadata = metadata.copy() if metadata else {}
-                entry_metadata["query"] = query
-                entry_metadata["response"] = response
+                entry_metadata = _pack_metadata(metadata, query, response)
 
                 # Store in backend
                 await self._backend.store_vector(

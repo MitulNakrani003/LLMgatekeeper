@@ -195,3 +195,21 @@ class TestSentenceTransformerProviderAsync:
         assert len(sync_results) == len(async_results)
         for sync_r, async_r in zip(sync_results, async_results):
             assert np.array_equal(sync_r, async_r)
+
+    @pytest.mark.asyncio
+    async def test_aembed_offloads_to_thread(self, provider, monkeypatch):
+        """aembed should run embed() via asyncio.to_thread to avoid blocking."""
+        import asyncio as asyncio_module
+
+        from llmgatekeeper.embeddings import sentence_transformer as st_module
+
+        called = []
+        real_to_thread = asyncio_module.to_thread
+
+        async def spy(fn, *args, **kwargs):
+            called.append(getattr(fn, "__name__", repr(fn)))
+            return await real_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(st_module.asyncio, "to_thread", spy)
+        await provider.aembed("hello")
+        assert len(called) == 1

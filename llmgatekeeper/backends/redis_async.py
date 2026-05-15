@@ -7,6 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from llmgatekeeper.backends.base import AsyncCacheBackend, CacheEntry, SearchResult
+from llmgatekeeper.exceptions import BackendError
 
 
 class AsyncRedisBackend(AsyncCacheBackend):
@@ -40,10 +41,34 @@ class AsyncRedisBackend(AsyncCacheBackend):
         self._namespace = namespace
         self._vector_dtype = vector_dtype
         self._keys_set = f"{namespace}:keys"
+        self._meta_key = f"{namespace}:meta"
 
     def _make_key(self, key: str) -> str:
         """Create a namespaced Redis key."""
         return f"{self._namespace}:entry:{key}"
+
+    async def _stored_dim(self) -> Optional[int]:
+        raw = await self._redis.hget(self._meta_key, "vector_dim")
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    async def _check_or_set_dim(self, dim: int, *, allow_set: bool) -> None:
+        existing = await self._stored_dim()
+        if existing is None:
+            if allow_set:
+                await self._redis.hset(self._meta_key, "vector_dim", str(dim))
+            return
+        if existing != dim:
+            raise BackendError(
+                f"Vector dimension mismatch: namespace {self._namespace!r} "
+                f"stores {existing}-dim vectors, got {dim}-dim."
+            )
 
     def _serialize_vector(self, vector: NDArray[np.float32]) -> bytes:
         """Serialize a numpy vector to bytes."""
@@ -78,6 +103,8 @@ class AsyncRedisBackend(AsyncCacheBackend):
             metadata: Arbitrary metadata to store with the vector.
             ttl: Optional time-to-live in seconds.
         """
+        await self._check_or_set_dim(int(vector.shape[0]), allow_set=True)
+
         redis_key = self._make_key(key)
         vector_bytes = self._serialize_vector(vector)
         metadata_json = json.dumps(metadata)
@@ -115,6 +142,13 @@ class AsyncRedisBackend(AsyncCacheBackend):
         Returns:
             List of SearchResult objects sorted by similarity (descending).
         """
+        existing = await self._stored_dim()
+        if existing is not None and existing != int(vector.shape[0]):
+            raise BackendError(
+                f"Vector dimension mismatch: namespace {self._namespace!r} "
+                f"stores {existing}-dim vectors, got {vector.shape[0]}-dim query."
+            )
+
         results: List[tuple[str, float, Dict[str, Any], NDArray[np.float32]]] = []
 
         # Get all keys from our tracking set
@@ -212,6 +246,7 @@ class AsyncRedisBackend(AsyncCacheBackend):
                 count += 1
 
         await self._redis.delete(self._keys_set)
+        await self._redis.delete(self._meta_key)
         return count
 
     async def count(self) -> int:

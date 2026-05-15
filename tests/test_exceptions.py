@@ -3,12 +3,12 @@
 import pytest
 
 from llmgatekeeper.exceptions import (
+    BackendConnectionError,
     BackendError,
+    BackendTimeoutError,
     CacheError,
     ConfigurationError,
-    ConnectionError,
     EmbeddingError,
-    TimeoutError,
 )
 
 
@@ -94,35 +94,35 @@ class TestConfigurationError:
         assert str(error) == "Invalid threshold"
 
 
-class TestConnectionError:
-    """Tests for the ConnectionError exception."""
+class TestBackendConnectionError:
+    """Tests for the BackendConnectionError exception."""
 
     def test_connection_error_inherits_backend_error(self):
-        """ConnectionError inherits from BackendError."""
-        assert issubclass(ConnectionError, BackendError)
+        """BackendConnectionError inherits from BackendError."""
+        assert issubclass(BackendConnectionError, BackendError)
 
     def test_can_catch_as_cache_error(self):
-        """ConnectionError can be caught as CacheError."""
+        """BackendConnectionError can be caught as CacheError."""
         with pytest.raises(CacheError):
-            raise ConnectionError("Test")
+            raise BackendConnectionError("Test")
 
     def test_can_catch_as_backend_error(self):
-        """ConnectionError can be caught as BackendError."""
+        """BackendConnectionError can be caught as BackendError."""
         with pytest.raises(BackendError):
-            raise ConnectionError("Test")
+            raise BackendConnectionError("Test")
 
 
-class TestTimeoutError:
-    """Tests for the TimeoutError exception."""
+class TestBackendTimeoutError:
+    """Tests for the BackendTimeoutError exception."""
 
     def test_timeout_error_inherits_backend_error(self):
-        """TimeoutError inherits from BackendError."""
-        assert issubclass(TimeoutError, BackendError)
+        """BackendTimeoutError inherits from BackendError."""
+        assert issubclass(BackendTimeoutError, BackendError)
 
     def test_can_catch_as_backend_error(self):
-        """TimeoutError can be caught as BackendError."""
+        """BackendTimeoutError can be caught as BackendError."""
         with pytest.raises(BackendError):
-            raise TimeoutError("Test")
+            raise BackendTimeoutError("Test")
 
 
 class TestExceptionHierarchy:
@@ -135,8 +135,8 @@ class TestExceptionHierarchy:
             BackendError("backend"),
             EmbeddingError("embedding"),
             ConfigurationError("config"),
-            ConnectionError("connection"),
-            TimeoutError("timeout"),
+            BackendConnectionError("connection"),
+            BackendTimeoutError("timeout"),
         ]
 
         for exc in exceptions:

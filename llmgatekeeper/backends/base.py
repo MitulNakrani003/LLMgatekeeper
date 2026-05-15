@@ -105,21 +105,21 @@ class CacheBackend(ABC):
         """
         pass
 
+    @abstractmethod
     def clear(self) -> int:
         """Clear all entries from the cache.
 
         Returns:
             Number of entries deleted.
         """
-        raise NotImplementedError("clear() is not implemented for this backend")
 
+    @abstractmethod
     def count(self) -> int:
         """Return the number of entries in the cache.
 
         Returns:
             Number of cached entries.
         """
-        raise NotImplementedError("count() is not implemented for this backend")
 
 
 class AsyncCacheBackend(ABC):
@@ -190,18 +190,18 @@ class AsyncCacheBackend(ABC):
         """
         pass
 
+    @abstractmethod
     async def clear(self) -> int:
         """Clear all entries from the cache asynchronously.
 
         Returns:
             Number of entries deleted.
         """
-        raise NotImplementedError("clear() is not implemented for this backend")
 
+    @abstractmethod
     async def count(self) -> int:
         """Return the number of entries in the cache asynchronously.
 
         Returns:
             Number of cached entries.
         """
-        raise NotImplementedError("count() is not implemented for this backend")

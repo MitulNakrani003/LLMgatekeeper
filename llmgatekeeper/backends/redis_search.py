@@ -11,6 +11,7 @@ from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
 
 from llmgatekeeper.backends.base import CacheBackend, CacheEntry, SearchResult
+from llmgatekeeper.exceptions import BackendError, ConfigurationError
 
 
 class RediSearchBackend(CacheBackend):
@@ -44,6 +45,14 @@ class RediSearchBackend(CacheBackend):
         Raises:
             RuntimeError: If RediSearch module is not available.
         """
+        if distance_metric.upper() != "COSINE":
+            raise ConfigurationError(
+                f"Only COSINE distance is currently supported; got "
+                f"distance_metric={distance_metric!r}. L2 and IP produce "
+                f"similarity scores that aren't in [0, 1] under the current "
+                f"conversion."
+            )
+
         self._redis = redis_client
         self._namespace = namespace
         self._vector_dimension = vector_dimension
@@ -77,35 +86,75 @@ class RediSearchBackend(CacheBackend):
             return False
 
     def _ensure_index_exists(self) -> None:
-        """Create the vector index if it doesn't exist."""
+        """Create the vector index if it doesn't exist; validate dim if it does."""
         try:
-            self._redis.ft(self._index_name).info()
+            info = self._redis.ft(self._index_name).info()
         except Exception:
-            # Index doesn't exist, create it
-            schema = (
-                TagField("$.key", as_name="key"),
-                TextField("$.metadata", as_name="metadata"),
-                VectorField(
-                    "$.vector",
-                    self._index_type,
-                    {
-                        "TYPE": "FLOAT32",
-                        "DIM": self._vector_dimension,
-                        "DISTANCE_METRIC": self._distance_metric,
-                    },
-                    as_name="vector",
-                ),
-            )
+            info = None
 
-            definition = IndexDefinition(
-                prefix=[f"{self._namespace}:entry:"],
-                index_type=IndexType.JSON,
-            )
+        if info is not None:
+            existing_dim = self._extract_index_dimension(info)
+            if existing_dim is not None and existing_dim != self._vector_dimension:
+                raise ConfigurationError(
+                    f"RediSearch index '{self._index_name}' was created with "
+                    f"vector dimension {existing_dim}, but backend was constructed "
+                    f"with vector_dimension={self._vector_dimension}. Drop the "
+                    f"index or use a different namespace."
+                )
+            return
 
-            self._redis.ft(self._index_name).create_index(
-                schema,
-                definition=definition,
-            )
+        schema = (
+            TagField("$.key", as_name="key"),
+            TextField("$.metadata", as_name="metadata"),
+            VectorField(
+                "$.vector",
+                self._index_type,
+                {
+                    "TYPE": "FLOAT32",
+                    "DIM": self._vector_dimension,
+                    "DISTANCE_METRIC": self._distance_metric,
+                },
+                as_name="vector",
+            ),
+        )
+
+        definition = IndexDefinition(
+            prefix=[f"{self._namespace}:entry:"],
+            index_type=IndexType.JSON,
+        )
+
+        self._redis.ft(self._index_name).create_index(
+            schema,
+            definition=definition,
+        )
+
+    @staticmethod
+    def _extract_index_dimension(info: Any) -> Optional[int]:
+        """Best-effort parse of an FT.INFO response to recover the vector DIM."""
+        if not isinstance(info, dict):
+            return None
+        attributes = info.get("attributes")
+        if not attributes:
+            return None
+        for attr in attributes:
+            if not isinstance(attr, (list, tuple)):
+                continue
+            attr_map: Dict[str, Any] = {}
+            for i in range(0, len(attr) - 1, 2):
+                k, v = attr[i], attr[i + 1]
+                if isinstance(k, bytes):
+                    k = k.decode()
+                if isinstance(v, bytes):
+                    v = v.decode()
+                attr_map[k] = v
+            if str(attr_map.get("type", "")).upper() == "VECTOR":
+                dim = attr_map.get("dim")
+                if dim is not None:
+                    try:
+                        return int(dim)
+                    except (TypeError, ValueError):
+                        return None
+        return None
 
     def _make_key(self, key: str) -> str:
         """Create a namespaced Redis key."""
@@ -160,27 +209,49 @@ class RediSearchBackend(CacheBackend):
         Returns:
             List of SearchResult objects sorted by similarity (descending).
         """
-        # Convert vector to bytes for KNN query
+        # Convert vector to bytes for query
         vector_bytes = vector.astype(np.float32).tobytes()
 
-        # Build KNN query
-        # Request more than top_k to allow filtering by threshold
-        k = min(top_k * 2, 100)  # Reasonable upper bound
-
-        query = (
-            Query(f"*=>[KNN {k} @vector $query_vec AS score]")
-            .sort_by("score")
-            .return_fields("key", "metadata", "score")
-            .dialect(2)
-        )
+        # When the caller has a meaningful threshold, use a VECTOR_RANGE query
+        # so we never miss valid matches because KNN's k was too small.
+        # When threshold is 0 (caller wants the best match regardless), KNN is
+        # cheaper and gives a stable best-first ordering.
+        if threshold > 0.0:
+            radius = max(0.0, 1.0 - threshold)
+            query = (
+                Query(
+                    f"@vector:[VECTOR_RANGE $radius $query_vec]"
+                    f"=>{{$YIELD_DISTANCE_AS: score}}"
+                )
+                .sort_by("score")
+                .paging(0, top_k)
+                .return_fields("key", "metadata", "score")
+                .dialect(2)
+            )
+            query_params = {
+                "query_vec": vector_bytes,
+                "radius": str(radius),
+            }
+        else:
+            k = min(top_k * 2, 100)
+            query = (
+                Query(f"*=>[KNN {k} @vector $query_vec AS score]")
+                .sort_by("score")
+                .return_fields("key", "metadata", "score")
+                .dialect(2)
+            )
+            query_params = {"query_vec": vector_bytes}
 
         try:
             results = self._redis.ft(self._index_name).search(
-                query, query_params={"query_vec": vector_bytes}
+                query, query_params=query_params
             )
-        except Exception:
-            # No results or index empty
-            return []
+        except Exception as e:
+            if "no such index" in str(e).lower():
+                return []
+            raise BackendError(
+                f"RediSearch query failed: {e}", original_error=e
+            )
 
         search_results = []
         for doc in results.docs:

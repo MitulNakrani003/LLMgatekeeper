@@ -95,31 +95,31 @@ class ConfigurationError(CacheError):
     pass
 
 
-class ConnectionError(BackendError):
-    """Exception raised when unable to connect to the backend.
+class BackendConnectionError(BackendError):
+    """Raised when the backend cannot be reached.
 
-    This is a specific type of BackendError for connection failures,
-    allowing more targeted error handling.
+    Renamed from ``ConnectionError`` to avoid shadowing Python's builtin
+    of the same name when users import from this module.
 
     Example:
         >>> try:
         ...     cache.set("query", "response")
-        ... except ConnectionError as e:
+        ... except BackendConnectionError as e:
         ...     print("Check your Redis connection")
     """
 
     pass
 
 
-class TimeoutError(BackendError):
-    """Exception raised when a backend operation times out.
+class BackendTimeoutError(BackendError):
+    """Raised when a backend operation times out.
 
-    This is a specific type of BackendError for timeout scenarios.
+    Renamed from ``TimeoutError`` to avoid shadowing Python's builtin.
 
     Example:
         >>> try:
         ...     cache.get("query")
-        ... except TimeoutError as e:
+        ... except BackendTimeoutError as e:
         ...     print("Operation timed out, try again")
     """
 

@@ -5,6 +5,7 @@ import pytest
 from fakeredis import FakeRedis
 
 from llmgatekeeper.backends.redis_simple import RedisSimpleBackend
+from llmgatekeeper.exceptions import BackendError
 
 
 @pytest.fixture
@@ -186,6 +187,36 @@ class TestRedisSimpleBackendInstance:
         # Check the key has the custom namespace prefix
         keys = list(user_redis.keys("custom_ns:*"))
         assert len(keys) > 0
+
+
+class TestRedisSimpleBackendDimensionValidation:
+    """Tests that mismatched vector dimensions are rejected, not silently broken."""
+
+    def test_store_mismatched_dim_raises(self, redis_backend):
+        """Storing a different-dimension vector after the first must raise."""
+        redis_backend.store_vector(
+            "k1", np.array([1.0, 0.0, 0.0], dtype=np.float32), {}
+        )
+        with pytest.raises(BackendError, match="dimension"):
+            redis_backend.store_vector(
+                "k2", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), {}
+            )
+
+    def test_search_mismatched_query_dim_raises(self, redis_backend):
+        """Querying with a different-dimension vector must raise."""
+        redis_backend.store_vector(
+            "k1", np.array([1.0, 0.0, 0.0], dtype=np.float32), {}
+        )
+        with pytest.raises(BackendError, match="dimension"):
+            redis_backend.search_similar(
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            )
+
+    def test_search_empty_cache_no_dim_check(self, redis_backend):
+        """Searching an empty cache must not error on dimension."""
+        query = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        results = redis_backend.search_similar(query)
+        assert results == []
 
 
 class TestRedisSimpleBackendClearAndCount:

@@ -1,5 +1,6 @@
 """SentenceTransformer embedding provider using local models."""
 
+import asyncio
 from typing import List, Optional
 
 import numpy as np
@@ -126,3 +127,11 @@ class SentenceTransformerProvider(EmbeddingProvider):
             batch_size=32,
         )
         return [emb.astype(np.float32) for emb in embeddings]
+
+    async def aembed(self, text: str) -> NDArray[np.float32]:
+        """Run the sync embed off the event loop via a worker thread."""
+        return await asyncio.to_thread(self.embed, text)
+
+    async def aembed_batch(self, texts: List[str]) -> List[NDArray[np.float32]]:
+        """Run the sync embed_batch off the event loop via a worker thread."""
+        return await asyncio.to_thread(self.embed_batch, texts)

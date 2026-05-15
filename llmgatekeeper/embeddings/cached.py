@@ -1,6 +1,7 @@
 """Cached embedding provider that wraps any EmbeddingProvider with caching."""
 
 import hashlib
+import threading
 from collections import OrderedDict
 from typing import List, Optional
 
@@ -57,8 +58,21 @@ class CachedEmbeddingProvider(EmbeddingProvider):
         self._redis_prefix = redis_prefix
         self._redis_ttl = redis_ttl
 
-        # LRU cache using OrderedDict
+        fingerprint_raw = "|".join(
+            [
+                provider.__class__.__name__,
+                str(provider.dimension),
+                str(getattr(provider, "model_name", "")),
+            ]
+        )
+        self._provider_fingerprint = hashlib.sha256(
+            fingerprint_raw.encode("utf-8")
+        ).hexdigest()[:16]
+        self._scoped_redis_prefix = f"{redis_prefix}{self._provider_fingerprint}:"
+
+        # LRU cache using OrderedDict, guarded by a lock for thread safety.
         self._cache: OrderedDict[str, NDArray[np.float32]] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     @property
     def dimension(self) -> int:
@@ -79,15 +93,14 @@ class CachedEmbeddingProvider(EmbeddingProvider):
         return self._provider
 
     def _hash_text(self, text: str) -> str:
-        """Create a hash key for the text.
+        """Create a hash key for the text, scoped by provider fingerprint.
 
-        Args:
-            text: The text to hash.
-
-        Returns:
-            A hex string hash of the text.
+        The fingerprint prevents collisions when multiple providers share a
+        Redis embedding cache: different models produce different vectors,
+        so they must occupy different keys.
         """
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        scoped = f"{self._provider_fingerprint}\0{text}".encode("utf-8")
+        return hashlib.sha256(scoped).hexdigest()
 
     def _get_from_cache(self, text: str) -> Optional[NDArray[np.float32]]:
         """Try to get embedding from cache (memory first, then Redis).
@@ -101,14 +114,14 @@ class CachedEmbeddingProvider(EmbeddingProvider):
         key = self._hash_text(text)
 
         # Check in-memory cache first
-        if key in self._cache:
-            # Move to end (most recently used)
-            self._cache.move_to_end(key)
-            return self._cache[key]
+        with self._cache_lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
 
         # Check Redis if available
         if self._redis is not None:
-            redis_key = f"{self._redis_prefix}{key}"
+            redis_key = f"{self._scoped_redis_prefix}{key}"
             data = self._redis.get(redis_key)
             if data is not None:
                 embedding = np.frombuffer(data, dtype=np.float32)
@@ -127,16 +140,13 @@ class CachedEmbeddingProvider(EmbeddingProvider):
             key: The cache key (hash of text).
             embedding: The embedding to cache.
         """
-        # If key already exists, move to end
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return
-
-        # Evict oldest if at capacity
-        while len(self._cache) >= self._max_size:
-            self._cache.popitem(last=False)
-
-        self._cache[key] = embedding
+        with self._cache_lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return
+            while len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+            self._cache[key] = embedding
 
     def _put_in_cache(self, text: str, embedding: NDArray[np.float32]) -> None:
         """Add embedding to all cache layers.
@@ -152,7 +162,7 @@ class CachedEmbeddingProvider(EmbeddingProvider):
 
         # Add to Redis if available
         if self._redis is not None:
-            redis_key = f"{self._redis_prefix}{key}"
+            redis_key = f"{self._scoped_redis_prefix}{key}"
             data = embedding.tobytes()
             if self._redis_ttl is not None:
                 self._redis.setex(redis_key, self._redis_ttl, data)
@@ -279,18 +289,20 @@ class CachedEmbeddingProvider(EmbeddingProvider):
 
         Note: This does not clear the Redis cache. Use clear_all() for that.
         """
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
     def clear_all(self) -> None:
         """Clear both in-memory and Redis caches.
 
         Warning: This will delete all keys matching the redis_prefix pattern.
         """
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
         if self._redis is not None:
-            # Find and delete all keys with the prefix
-            pattern = f"{self._redis_prefix}*"
+            # Find and delete only this provider's keys (fingerprint-scoped)
+            pattern = f"{self._scoped_redis_prefix}*"
             cursor = 0
             while True:
                 cursor, keys = self._redis.scan(cursor, match=pattern, count=100)

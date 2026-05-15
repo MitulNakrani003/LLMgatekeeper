@@ -218,8 +218,8 @@ class TestSemanticCacheSet:
         metadata = call_args.kwargs["metadata"]
         assert metadata["model"] == "gpt-4"
         assert metadata["tokens"] == 50
-        assert metadata["query"] == "What is Python?"
-        assert metadata["response"] == "A programming language."
+        assert metadata["_llmgk"]["query"] == "What is Python?"
+        assert metadata["_llmgk"]["response"] == "A programming language."
 
     def test_set_with_ttl(self, cache_with_mocks, mock_backend):
         """Set passes TTL to backend."""
@@ -316,12 +316,17 @@ class TestSemanticCacheGet:
         assert result.metadata == {"custom": "value"}
 
     def test_get_with_threshold_override(self, cache_with_mocks, mock_backend):
-        """Can override threshold per query."""
-        mock_backend.search_similar.return_value = []
-        cache_with_mocks.get("query", threshold=0.99)
-        # Check that retriever was called with overridden threshold
-        call_args = mock_backend.search_similar.call_args
-        assert call_args.kwargs["threshold"] == 0.99
+        """Per-query threshold override turns a borderline hit into a miss."""
+        mock_backend.search_similar.return_value = [
+            SearchResult(
+                key="k",
+                similarity=0.90,
+                metadata={"_llmgk": {"query": "q", "response": "r"}},
+            )
+        ]
+        # Default 0.85 → hit; override to 0.99 → miss.
+        assert cache_with_mocks.get("query") == "r"
+        assert cache_with_mocks.get("query", threshold=0.99) is None
 
     def test_get_generates_embedding(
         self, cache_with_mocks, mock_embedding_provider
@@ -684,6 +689,99 @@ class TestSemanticCacheTTL:
         assert call_args.kwargs["metadata"]["model"] == "gpt-4"
 
 
+class TestSemanticCacheAnalyticsLatency:
+    """Analytics tracking must not double backend traffic."""
+
+    def test_miss_with_analytics_makes_one_search(
+        self, mock_redis, mock_backend, mock_embedding_provider
+    ):
+        """A cache miss must trigger at most one backend search_similar call."""
+        mock_backend.search_similar.return_value = []
+        cache = SemanticCache(
+            mock_redis,
+            backend=mock_backend,
+            embedding_provider=mock_embedding_provider,
+            enable_analytics=True,
+        )
+
+        result = cache.get("anything")
+        assert result is None
+        assert mock_backend.search_similar.call_count == 1
+
+    def test_miss_records_closest_similarity_without_second_search(
+        self, mock_redis, mock_backend, mock_embedding_provider
+    ):
+        """Near-miss tracking should reuse the first search's best candidate."""
+        mock_backend.search_similar.return_value = [
+            SearchResult(
+                key="k",
+                similarity=0.80,
+                metadata={"_llmgk": {"query": "x", "response": "y"}},
+            )
+        ]
+        cache = SemanticCache(
+            mock_redis,
+            backend=mock_backend,
+            embedding_provider=mock_embedding_provider,
+            threshold=0.85,
+            enable_analytics=True,
+        )
+
+        result = cache.get("anything")
+        assert result is None
+        assert mock_backend.search_similar.call_count == 1
+        stats = cache.stats()
+        assert len(stats.near_misses) == 1
+        assert stats.near_misses[0].closest_similarity == pytest.approx(0.80)
+
+
+class TestSemanticCacheMetadataReservedKeys:
+    """User metadata must not collide with the cache's internal storage keys."""
+
+    def test_user_metadata_query_key_preserved(
+        self, mock_redis, mock_backend, mock_embedding_provider
+    ):
+        """metadata={'query': 'user value'} must round-trip unchanged."""
+        cache = SemanticCache(
+            mock_redis,
+            backend=mock_backend,
+            embedding_provider=mock_embedding_provider,
+        )
+
+        cache.set("q", "r", metadata={"query": "user value", "source": "docs"})
+
+        stored_metadata = mock_backend.store_vector.call_args.kwargs["metadata"]
+        mock_backend.search_similar.return_value = [
+            SearchResult(key="key", similarity=0.95, metadata=stored_metadata)
+        ]
+
+        result = cache.get("q", include_metadata=True)
+        assert result.response == "r"
+        assert result.metadata["query"] == "user value"
+        assert result.metadata["source"] == "docs"
+
+    def test_user_metadata_response_key_preserved(
+        self, mock_redis, mock_backend, mock_embedding_provider
+    ):
+        """metadata={'response': 'user value'} must round-trip unchanged."""
+        cache = SemanticCache(
+            mock_redis,
+            backend=mock_backend,
+            embedding_provider=mock_embedding_provider,
+        )
+
+        cache.set("q", "the real response", metadata={"response": "user value"})
+
+        stored_metadata = mock_backend.store_vector.call_args.kwargs["metadata"]
+        mock_backend.search_similar.return_value = [
+            SearchResult(key="key", similarity=0.95, metadata=stored_metadata)
+        ]
+
+        result = cache.get("q", include_metadata=True)
+        assert result.response == "the real response"
+        assert result.metadata["response"] == "user value"
+
+
 class TestSemanticCacheMetadata:
     """Tests for metadata support (Task 5.3)."""
 
@@ -766,10 +864,9 @@ class TestSemanticCacheMetadata:
         cache_with_mocks.set("query", "response")
         call_args = mock_backend.store_vector.call_args
         metadata = call_args.kwargs["metadata"]
-        # Only query and response should be present
-        assert metadata["query"] == "query"
-        assert metadata["response"] == "response"
-        assert len(metadata) == 2
+        # Internal fields only — user metadata is empty.
+        assert metadata["_llmgk"] == {"query": "query", "response": "response"}
+        assert len(metadata) == 1
 
     def test_metadata_preserved_through_round_trip(
         self, mock_redis, mock_backend, mock_embedding_provider
@@ -1160,8 +1257,8 @@ class TestSemanticCacheWarm:
 
         call_args = mock_backend.store_vector.call_args
         metadata = call_args.kwargs["metadata"]
-        assert metadata["query"] == "What is Python?"
-        assert metadata["response"] == "A programming language"
+        assert metadata["_llmgk"]["query"] == "What is Python?"
+        assert metadata["_llmgk"]["response"] == "A programming language"
 
     def test_warm_returns_count(self, cache_with_mocks):
         """Warm returns number of stored entries."""

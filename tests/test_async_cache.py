@@ -8,6 +8,7 @@ import pytest
 
 from llmgatekeeper.backends.base import AsyncCacheBackend, SearchResult
 from llmgatekeeper.cache import AsyncSemanticCache, CacheResult
+from llmgatekeeper.exceptions import BackendError
 from llmgatekeeper.similarity.confidence import ConfidenceLevel
 
 
@@ -61,6 +62,26 @@ def async_cache(mock_async_backend, mock_async_embedding_provider):
         backend=mock_async_backend,
         embedding_provider=mock_async_embedding_provider,
     )
+
+
+class TestAsyncSemanticCacheErrorWrapping:
+    """Backend exceptions must surface as BackendError for both set and get."""
+
+    @pytest.mark.asyncio
+    async def test_set_wraps_backend_error(
+        self, async_cache, mock_async_backend
+    ):
+        mock_async_backend.store_vector.side_effect = RuntimeError("redis down")
+        with pytest.raises(BackendError):
+            await async_cache.set("q", "r")
+
+    @pytest.mark.asyncio
+    async def test_get_wraps_backend_error(
+        self, async_cache, mock_async_backend
+    ):
+        mock_async_backend.search_similar.side_effect = RuntimeError("redis down")
+        with pytest.raises(BackendError):
+            await async_cache.get("q")
 
 
 class TestAsyncSemanticCacheInit:

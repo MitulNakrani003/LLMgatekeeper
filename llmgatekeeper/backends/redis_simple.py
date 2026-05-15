@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from redis import Redis
 
 from llmgatekeeper.backends.base import CacheBackend, CacheEntry, SearchResult
+from llmgatekeeper.exceptions import BackendError
 
 
 class RedisSimpleBackend(CacheBackend):
@@ -37,10 +38,40 @@ class RedisSimpleBackend(CacheBackend):
         self._namespace = namespace
         self._vector_dtype = vector_dtype
         self._keys_set = f"{namespace}:keys"
+        self._meta_key = f"{namespace}:meta"
 
     def _make_key(self, key: str) -> str:
         """Create a namespaced Redis key."""
         return f"{self._namespace}:entry:{key}"
+
+    def _stored_dim(self) -> Optional[int]:
+        """Return the dimension previously stored for this namespace, if any."""
+        raw = self._redis.hget(self._meta_key, "vector_dim")
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _check_or_set_dim(self, dim: int, *, allow_set: bool) -> None:
+        """Compare a vector's dimension against the namespace's recorded dim.
+
+        Sets the dim on first write if allow_set=True. Raises BackendError on
+        mismatch.
+        """
+        existing = self._stored_dim()
+        if existing is None:
+            if allow_set:
+                self._redis.hset(self._meta_key, "vector_dim", str(dim))
+            return
+        if existing != dim:
+            raise BackendError(
+                f"Vector dimension mismatch: namespace {self._namespace!r} "
+                f"stores {existing}-dim vectors, got {dim}-dim."
+            )
 
     def _serialize_vector(self, vector: NDArray[np.float32]) -> bytes:
         """Serialize a numpy vector to bytes."""
@@ -75,6 +106,8 @@ class RedisSimpleBackend(CacheBackend):
             metadata: Arbitrary metadata to store with the vector.
             ttl: Optional time-to-live in seconds.
         """
+        self._check_or_set_dim(int(vector.shape[0]), allow_set=True)
+
         redis_key = self._make_key(key)
         vector_bytes = self._serialize_vector(vector)
         metadata_json = json.dumps(metadata)
@@ -112,24 +145,51 @@ class RedisSimpleBackend(CacheBackend):
         Returns:
             List of SearchResult objects sorted by similarity (descending).
         """
+        existing = self._stored_dim()
+        if existing is not None and existing != int(vector.shape[0]):
+            raise BackendError(
+                f"Vector dimension mismatch: namespace {self._namespace!r} "
+                f"stores {existing}-dim vectors, got {vector.shape[0]}-dim query."
+            )
+
         results: List[tuple[str, float, Dict[str, Any], NDArray[np.float32]]] = []
 
-        # Get all keys from our tracking set
+        # Fetch all entries in a single pipeline round trip rather than N+1.
         keys = self._redis.smembers(self._keys_set)
+        decoded_keys = [
+            (k.decode() if isinstance(k, bytes) else k) for k in keys
+        ]
+        if not decoded_keys:
+            return []
 
-        for key_bytes in keys:
-            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
-            entry = self.get_by_key(key)
+        pipe = self._redis.pipeline()
+        for key in decoded_keys:
+            pipe.hgetall(self._make_key(key))
+        raw_entries = pipe.execute()
 
-            if entry is None:
-                # Key expired or was deleted, remove from tracking set
-                self._redis.srem(self._keys_set, key)
+        stale_keys: List[str] = []
+        for key, data in zip(decoded_keys, raw_entries):
+            if not data:
+                stale_keys.append(key)
                 continue
-
-            similarity = self._cosine_similarity(vector, entry.vector)
-
+            vector_data = data.get(b"vector") or data.get("vector")
+            metadata_data = data.get(b"metadata") or data.get("metadata")
+            if vector_data is None or metadata_data is None:
+                stale_keys.append(key)
+                continue
+            entry_vector = self._deserialize_vector(vector_data)
+            metadata_str = (
+                metadata_data.decode()
+                if isinstance(metadata_data, bytes)
+                else metadata_data
+            )
+            entry_metadata = json.loads(metadata_str)
+            similarity = self._cosine_similarity(vector, entry_vector)
             if similarity >= threshold:
-                results.append((entry.key, similarity, entry.metadata, entry.vector))
+                results.append((key, similarity, entry_metadata, entry_vector))
+
+        if stale_keys:
+            self._redis.srem(self._keys_set, *stale_keys)
 
         # Sort by similarity descending and take top_k
         results.sort(key=lambda x: x[1], reverse=True)
@@ -209,6 +269,7 @@ class RedisSimpleBackend(CacheBackend):
                 count += 1
 
         self._redis.delete(self._keys_set)
+        self._redis.delete(self._meta_key)
         return count
 
     def count(self) -> int:

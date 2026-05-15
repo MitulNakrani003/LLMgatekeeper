@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmgatekeeper"
-version = "0.1.0"
+version = "0.2.0"
 description = "Semantic caching library for LLM and RAG systems"
 readme = "README.md"
 license = {text = "MIT"}
@@ -46,9 +46,11 @@ dev = [
 all = ["llmgatekeeper[openai,dev]"]
 
 [project.urls]
-Homepage = "https://github.com/llmgatekeeper/llmgatekeeper"
-Documentation = "https://github.com/llmgatekeeper/llmgatekeeper#readme"
-Repository = "https://github.com/llmgatekeeper/llmgatekeeper"
+Homepage = "https://github.com/MitulNakrani003/LLMgatekeeper"
+Documentation = "https://github.com/MitulNakrani003/LLMgatekeeper#readme"
+Repository = "https://github.com/MitulNakrani003/LLMgatekeeper"
+Issues = "https://github.com/MitulNakrani003/LLMgatekeeper/issues"
+Changelog = "https://github.com/MitulNakrani003/LLMgatekeeper/releases"
 
 [tool.setuptools.packages.find]
 where = ["."]

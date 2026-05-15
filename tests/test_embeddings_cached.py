@@ -369,6 +369,109 @@ class TestCachedEmbeddingProviderClearCache:
         mock_redis.delete.assert_called()
 
 
+class FakeRedis:
+    """In-process dict-backed Redis stand-in for cross-provider tests."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value):
+        self.store[key] = value
+
+    def setex(self, key, ttl, value):
+        self.store[key] = value
+
+    def scan(self, cursor, match=None, count=None):
+        keys = list(self.store.keys())
+        if match:
+            prefix = match.rstrip("*")
+            keys = [k for k in keys if isinstance(k, str) and k.startswith(prefix)]
+        return (0, keys)
+
+    def delete(self, *keys):
+        for k in keys:
+            self.store.pop(k, None)
+
+
+class TestCachedEmbeddingProviderProviderIsolation:
+    """Different providers sharing a Redis cache must not collide."""
+
+    def test_redis_cache_isolates_by_dimension(self):
+        """A 384-dim provider must not serve a 768-dim provider's cache miss."""
+        redis = FakeRedis()
+
+        provider_a = MockEmbeddingProvider(dim=384)
+        provider_b = MockEmbeddingProvider(dim=768)
+
+        cached_a = CachedEmbeddingProvider(
+            provider_a, redis_client=redis, redis_prefix="emb:"
+        )
+        cached_b = CachedEmbeddingProvider(
+            provider_b, redis_client=redis, redis_prefix="emb:"
+        )
+
+        emb_a = cached_a.embed("hello")
+        emb_b = cached_b.embed("hello")
+
+        assert emb_a.shape == (384,)
+        assert emb_b.shape == (768,)
+        assert provider_b.embed_call_count == 1
+
+    def test_redis_cache_isolates_by_model_name(self):
+        """Same dim, different model_name must produce independent cache entries."""
+        redis = FakeRedis()
+
+        class NamedProvider(MockEmbeddingProvider):
+            def __init__(self, model_name, dim=384):
+                super().__init__(dim=dim)
+                self.model_name = model_name
+
+            def embed(self, text):
+                self.embed_call_count += 1
+                np.random.seed((hash(self.model_name) ^ hash(text)) % (2**32))
+                return np.random.rand(self._dimension).astype(np.float32)
+
+        provider_a = NamedProvider("model-a")
+        provider_b = NamedProvider("model-b")
+
+        cached_a = CachedEmbeddingProvider(
+            provider_a, redis_client=redis, redis_prefix="emb:"
+        )
+        cached_b = CachedEmbeddingProvider(
+            provider_b, redis_client=redis, redis_prefix="emb:"
+        )
+
+        emb_a = cached_a.embed("hello")
+        emb_b = cached_b.embed("hello")
+
+        assert not np.array_equal(emb_a, emb_b)
+        assert provider_b.embed_call_count == 1
+
+
+class TestCachedEmbeddingProviderConcurrency:
+    """Concurrent embed calls must not crash the LRU."""
+
+    def test_concurrent_embed_smoke(self):
+        import concurrent.futures
+
+        provider = MockEmbeddingProvider()
+        cached = CachedEmbeddingProvider(provider, max_size=10)
+
+        def worker(i):
+            for j in range(50):
+                cached.embed(f"text_{(i * 50 + j) % 20}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(worker, i) for i in range(8)]
+            for f in futures:
+                f.result()
+
+        assert cached.cache_size() <= 10
+
+
 class TestCachedEmbeddingProviderEdgeCases:
     """Edge case tests."""
 

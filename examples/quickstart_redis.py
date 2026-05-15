@@ -47,12 +47,17 @@ from llmgatekeeper import (
 )
 
 # Sub-module imports used in deeper examples
-from llmgatekeeper.backends.factory import create_redis_backend
+from llmgatekeeper.backends.factory import (
+    create_async_redis_backend,
+    create_redis_backend,
+)
 from llmgatekeeper.backends.redis_simple import RedisSimpleBackend
 from llmgatekeeper.embeddings.cached import CachedEmbeddingProvider
 from llmgatekeeper.embeddings.sentence_transformer import SentenceTransformerProvider
-from llmgatekeeper.exceptions import ConnectionError as CacheConnectionError
-from llmgatekeeper.exceptions import TimeoutError as CacheTimeoutError
+from llmgatekeeper.exceptions import (
+    BackendConnectionError,
+    BackendTimeoutError,
+)
 from llmgatekeeper.logging import get_logger, log_operation
 from llmgatekeeper.similarity.confidence import (
     ConfidenceClassifier,
@@ -151,10 +156,19 @@ def section_cache_result():
     cache = SemanticCache(client, namespace="s2_result", threshold=0.80)
     cache.clear()
 
+    # User keys with the same name as internal fields ('query', 'response')
+    # round-trip unchanged — the cache stores its bookkeeping under a single
+    # reserved key ('_llmgk') that never collides with user metadata.
     cache.set(
         "Explain recursion",
         "Recursion is a technique where a function calls itself.",
-        metadata={"model": "gpt-4", "tokens": 12, "category": "cs"},
+        metadata={
+            "model": "gpt-4",
+            "tokens": 12,
+            "category": "cs",
+            "query": "user-controlled value",
+            "response": "also user-controlled",
+        },
     )
 
     # Passing include_metadata=True returns a CacheResult instead of a plain string
@@ -165,8 +179,8 @@ def section_cache_result():
         print(f"similarity  -> {result.similarity:.4f}")
         print(f"confidence  -> {result.confidence}")          # ConfidenceLevel enum
         print(f"key         -> {result.key}")
-        # metadata contains only user-supplied fields; 'query' and 'response'
-        # are stored internally but stripped from the returned metadata dict.
+        # The reserved '_llmgk' key is hidden; user fields (including any
+        # 'query'/'response') are returned verbatim.
         print(f"metadata    -> {result.metadata}")
         # CacheResult.__str__() returns the response string directly
         print(f"str(result) -> {str(result)}")
@@ -387,6 +401,9 @@ def section_dynamic_properties():
 # =============================================================================
 # SECTION 9 – Analytics & Statistics
 #   enable_analytics, stats(), reset_stats(), CacheStats, NearMiss, QueryInfo
+#   Each get() issues exactly one backend search whether it hits or misses —
+#   near-miss tracking reuses the same result, so analytics doesn't double
+#   the request rate to Redis.
 # =============================================================================
 def section_analytics():
     print("\n" + "=" * 70)
@@ -459,7 +476,8 @@ def section_analytics():
 # =============================================================================
 # SECTION 10 – Error Handling & Exception Hierarchy
 #   CacheError, BackendError, EmbeddingError, ConfigurationError,
-#   ConnectionError, TimeoutError  (all have .original_error where applicable)
+#   BackendConnectionError, BackendTimeoutError
+#   (Backend* names are explicitly prefixed so they don't shadow Python builtins.)
 # =============================================================================
 def section_error_handling():
     print("\n" + "=" * 70)
@@ -470,8 +488,8 @@ def section_error_handling():
     print("  Exception hierarchy:")
     print("    CacheError")
     print("      ├── BackendError          (.original_error)")
-    print("      │     ├── ConnectionError")
-    print("      │     └── TimeoutError")
+    print("      │     ├── BackendConnectionError")
+    print("      │     └── BackendTimeoutError")
     print("      ├── EmbeddingError        (.original_error)")
     print("      └── ConfigurationError")
 
@@ -509,12 +527,16 @@ def section_error_handling():
     ce = ConfigurationError("threshold out of range")
     print(f"  Constructed ConfigurationError: {ce}")
 
-    conn_err = CacheConnectionError("Redis unreachable", original_error=OSError("timeout"))
-    print(f"  Constructed ConnectionError: {conn_err}  "
+    conn_err = BackendConnectionError(
+        "Redis unreachable", original_error=OSError("timeout")
+    )
+    print(f"  Constructed BackendConnectionError: {conn_err}  "
           f"(is BackendError: {isinstance(conn_err, BackendError)})")
 
-    t_err = CacheTimeoutError("operation timed out", original_error=TimeoutError())
-    print(f"  Constructed TimeoutError: {t_err}  "
+    t_err = BackendTimeoutError(
+        "operation timed out", original_error=TimeoutError()
+    )
+    print(f"  Constructed BackendTimeoutError: {t_err}  "
           f"(is BackendError: {isinstance(t_err, BackendError)})")
 
     # --- Catching a bad threshold raises ValueError ----------------------------
@@ -600,6 +622,31 @@ def section_backends():
     except RuntimeError:
         print(f"  RediSearch not available – drop_index() skipped")
 
+    # --- Backend safety rails ---------------------------------------------------
+    # Backends record the embedding dimension on first write under
+    # '{namespace}:meta'. Storing or searching with a different-dim vector
+    # raises BackendError before any numpy operation can produce garbage.
+    safety_backend = create_redis_backend(
+        client, namespace="s12_safety", vector_dimension=384, force_simple=True
+    )
+    safety_backend.clear()
+    safety_backend.store_vector(
+        "k1", np.array([1.0, 0.0, 0.0], dtype=np.float32), {"r": "ok"}
+    )
+    try:
+        safety_backend.store_vector(
+            "k2", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), {}
+        )
+    except BackendError as exc:
+        print(f"  Dimension mismatch caught -> {exc}")
+
+    # The RediSearch backend additionally validates an existing index's DIM
+    # against the constructor argument, and rejects non-COSINE distance metrics.
+    try:
+        RediSearchBackend(client, namespace="s12_safety_rs", distance_metric="L2")
+    except (ConfigurationError, RuntimeError) as exc:
+        print(f"  Non-cosine metric rejected -> {exc}")
+
 
 # =============================================================================
 # SECTION 13 – Embedding Providers
@@ -648,6 +695,10 @@ def section_embedding_providers():
     print(f"  cache_size() after clear_cache() -> {cached_provider.cache_size()}")
 
     # --- CachedEmbeddingProvider with Redis persistence -------------------------
+    # Each CachedEmbeddingProvider is tied to a provider fingerprint
+    # (class + dimension + model_name) so two providers sharing the same Redis
+    # cache will never serve each other's vectors. The in-memory LRU is also
+    # thread-safe — concurrent embed() calls won't corrupt the OrderedDict.
     client = get_redis_client()
     cached_redis = CachedEmbeddingProvider(
         provider=provider,
@@ -656,9 +707,10 @@ def section_embedding_providers():
         redis_prefix="llmgk:emb:",
         redis_ttl=3600,            # Redis entries expire after 1 hour
     )
+    print(f"  provider fingerprint -> {cached_redis._provider_fingerprint}")
     _ = cached_redis.embed("persisted embedding")
     print(f"  Redis-backed cache_size() -> {cached_redis.cache_size()}")
-    cached_redis.clear_all()       # clears both memory and Redis keys
+    cached_redis.clear_all()       # clears only this fingerprint's Redis keys
     print(f"  After clear_all() cache_size() -> {cached_redis.cache_size()}")
 
     # --- Use a cached provider with SemanticCache -------------------------------
@@ -872,8 +924,10 @@ def section_retriever():
 
 # =============================================================================
 # SECTION 17 – Async API
-#   AsyncSemanticCache + AsyncRedisBackend
+#   AsyncSemanticCache + create_async_redis_backend
 #   All methods mirror the sync API; stats()/reset_stats() stay synchronous.
+#   The async factory auto-detects RediSearch the same way the sync one does
+#   and returns the right backend (AsyncRediSearchBackend or AsyncRedisBackend).
 # =============================================================================
 async def section_async():
     print("\n" + "=" * 70)
@@ -882,11 +936,13 @@ async def section_async():
 
     import redis.asyncio as aioredis
 
-    from llmgatekeeper.backends.redis_async import AsyncRedisBackend
-
     aclient = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
 
-    backend = AsyncRedisBackend(aclient, namespace="s17_async")
+    # Async factory: returns AsyncRediSearchBackend when the module is loaded,
+    # otherwise AsyncRedisBackend. RediSearch path also calls .connect() for you.
+    backend = await create_async_redis_backend(aclient, namespace="s17_async")
+    print(f"  selected backend -> {type(backend).__name__}")
+
     cache = AsyncSemanticCache(
         backend,
         namespace="s17_async",
